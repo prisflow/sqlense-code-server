@@ -101,7 +101,7 @@ jobs:
     if: needs.changes.outputs.helm == 'true'
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
       - run: helm plugin install https://github.com/instrumenta/helm-kubeval
