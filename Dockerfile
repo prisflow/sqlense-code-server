@@ -18,23 +18,14 @@ RUN curl -fsSL https://github.com/coder/code-server/releases/download/v4.99.3/co
 
 COPY --from=builder /app/out/ /opt/sqlense-code-server/out/
 
-# Stage 3: 预编译 SQLense 扩展依赖（从 --build-context ext-src 引入源码）
-FROM node:22-alpine AS ext-builder
-WORKDIR /ext
-COPY --from=ext-src / ./
-RUN npm install --omit=dev
-
-# Stage 4: 运行期（只装 dumb-init，用捆绑的 lib/node）
+# Stage 3: 运行期（SQLense 扩展由 sqlense 仓库 volume 注入 /workspaces/.shared-extensions/sqlense-vscode）
 FROM debian:12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     dumb-init \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /workspaces/.shared-extensions
-
 COPY --from=release /opt/sqlense-code-server/ /opt/sqlense-code-server/
-COPY --from=ext-builder /ext/ /workspaces/.shared-extensions/sqlense-vscode/
 
 WORKDIR /opt/sqlense-code-server
 
