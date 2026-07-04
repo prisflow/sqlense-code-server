@@ -4,10 +4,12 @@ FROM node:22-bookworm AS builder
 WORKDIR /app
 COPY package.json package-lock.json tsconfig.json ./
 COPY typings/ typings/
-COPY ci/ ci/
 COPY src/ src/
 
-RUN npm ci --ignore-scripts && npm run build
+RUN npm ci --ignore-scripts && npx tsc && \
+    if ! grep -q "^#!/usr/bin/env node" out/node/entry.js; then \
+      sed -i "1s;^;#!/usr/bin/env node\n;" out/node/entry.js && chmod +x out/node/entry.js; \
+    fi
 
 # Stage 2: 下载上游 standalone release（自备 node_modules + VS Code + lib/node）
 FROM node:22-bookworm AS release

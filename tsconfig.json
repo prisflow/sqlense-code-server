@@ -18,13 +18,11 @@
     "incremental": true,
     "typeRoots": [
       "./node_modules/@types",
-      "./typings",
-      "./test/node_modules/@types",
-      "./lib/vscode/src/vs/server/@types"
+      "./typings"
     ],
     "downlevelIteration": true,
     "resolveJsonModule": true
   },
   "include": ["./src/**/*"],
-  "exclude": ["/test", "/lib", "/ci", "/doc"]
+  "exclude": []
 }

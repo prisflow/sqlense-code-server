@@ -1,7 +1,6 @@
 *
 !src/**
 !typings/**
-!ci/**
 !package.json
 !package-lock.json
 !tsconfig.json
