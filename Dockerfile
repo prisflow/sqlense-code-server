@@ -35,8 +35,6 @@ RUN mkdir -p /workspaces/.shared-extensions
 
 COPY --from=release /opt/sqlense-code-server/ /opt/sqlense-code-server/
 COPY --from=ext-builder /ext/ /workspaces/.shared-extensions/sqlense-vscode/
-COPY startup.sh /startup.sh
-RUN chmod +x /startup.sh
 
 WORKDIR /opt/sqlense-code-server
 
