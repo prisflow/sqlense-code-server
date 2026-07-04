@@ -1,3 +1,8 @@
-**
-!release-packages
-!ci
+*
+!src/**
+!typings/**
+!ci/**
+!package.json
+!package-lock.json
+!tsconfig.json
+!startup.sh

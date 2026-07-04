@@ -9,6 +9,7 @@ release-gcp/
 release-images/
 node_modules
 /plugins
+/lib/
 /lib/coder-cloud-agent
 .home
 coverage

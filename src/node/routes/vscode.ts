@@ -32,26 +32,86 @@ export type VSCodeModule = {
   }>
 }
 
+/**
+ * Extract student ID from request header.
+ */
 function getStudentId(req: express.Request): string {
   return (req.headers["x-student-id"] as string) || ""
 }
 
-function getStudentDataDir(studentId: string): string {
-  return path.join("/workspaces", `student_${studentId}`, ".code-server")
-}
-
-function getStudentExtensionsDir(): string {
-  return "/workspaces/.shared-extensions"
-}
-
+/**
+ * Build per-student workspace directory path.
+ */
 function getStudentWorkspaceDir(studentId: string): string {
   return path.join("/workspaces", `student_${studentId}`)
 }
 
 /**
- * Load then create a VS Code server for a specific student.
+ * Build per-student .vscode/settings.json path.
  */
-async function loadVSCode(req: express.Request, studentId: string): Promise<IVSCodeServerAPI> {
+function getStudentSettingsPath(studentId: string): string {
+  return path.join(getStudentWorkspaceDir(studentId), ".vscode", "settings.json")
+}
+
+/**
+ * Lazily create per-student workspace settings by fetching student config
+ * from the API server.
+ */
+async function ensureStudentWorkspace(studentId: string): Promise<void> {
+  const settingsPath = getStudentSettingsPath(studentId)
+  if (await isFile(settingsPath).catch(() => false)) {
+    return
+  }
+
+  const apiUrl = process.env.API_SERVER_URL || "http://api-server:4000"
+  let studentConfig: Record<string, string> | null = null
+
+  try {
+    const resp = await fetch(`${apiUrl}/api/students/${studentId}/workspace-env`)
+    if (resp.ok) {
+      const data = await resp.json()
+      studentConfig = data.student
+    }
+  } catch (err) {
+    logger.warn(`[vscode] Failed to fetch student config from API: ${err}`)
+  }
+
+  const displayName = studentConfig?.display_name || studentId
+  const dbName = studentConfig?.pg_db_name || `db_student_${studentId}`
+  const dbUser = studentConfig?.pg_role_name || `role_student_${studentId}`
+  const dbPass = studentConfig?.cs_password || studentId
+  const wsServer = process.env.WS_SERVER || "ws://websocket:3001"
+  const pgHost = process.env.PG_HOST || "postgres"
+
+  const workspaceDir = getStudentWorkspaceDir(studentId)
+  const vscodeDir = path.join(workspaceDir, ".vscode")
+  await fs.mkdir(vscodeDir, { recursive: true })
+
+  const settings = {
+    "sqlense.wsServer": wsServer,
+    "sqlense.studentId": studentId,
+    "sqlense.studentName": displayName,
+    "sqltools.connections": [
+      {
+        name: "实验数据库",
+        driver: "PostgreSQL",
+        server: pgHost,
+        port: 5432,
+        database: dbName,
+        username: dbUser,
+        password: dbPass,
+      },
+    ],
+  }
+
+  await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2), "utf8")
+  logger.info(`[vscode] Created workspace settings for student ${studentId}`)
+}
+
+/**
+ * Load then create the single VS Code server instance.
+ */
+async function loadVSCode(req: express.Request): Promise<IVSCodeServerAPI> {
   let modPath = path.join(vsRootPath, "out/server-main.js")
   if (os.platform() === "win32") {
     modPath = "file:///" + modPath.replace(/\\/g, "/")
@@ -60,41 +120,38 @@ async function loadVSCode(req: express.Request, studentId: string): Promise<IVSC
   const serverModule = await mod.loadCodeWithNls()
   return serverModule.createServer(null, {
     ...(await toCodeArgs(req.args)),
-    "user-data-dir": getStudentDataDir(studentId),
-    "extensions-dir": getStudentExtensionsDir(),
+    "extensions-dir": "/workspaces/.shared-extensions",
     "accept-server-license-terms": true,
     compatibility: "1.64",
     "without-connection-token": true,
   })
 }
 
-// Per-student VS Code server instances.
-const vscodeServers = new Map<string, IVSCodeServerAPI>()
-const vscodeServersLoading = new Map<string, Promise<IVSCodeServerAPI>>()
+// Single VS Code server instance (lazily created on first request)
+let vscodeServer: IVSCodeServerAPI | undefined
+let vscodeServerPromise: Promise<IVSCodeServerAPI> | undefined
 
-export const ensureStudentVSCodeLoaded = async (
+/**
+ * Middleware that ensures the single VS Code server is loaded.
+ */
+async function ensureVSCodeLoaded(
   req: express.Request,
   _: express.Response,
   next: express.NextFunction,
-): Promise<void> => {
-  const studentId = getStudentId(req)
-  if (!studentId) {
+): Promise<void> {
+  if (vscodeServer) {
     return next()
   }
 
-  if (vscodeServers.has(studentId)) {
-    return next()
-  }
-
-  if (!vscodeServersLoading.has(studentId)) {
-    vscodeServersLoading.set(studentId, loadVSCode(req, studentId))
+  if (!vscodeServerPromise) {
+    vscodeServerPromise = loadVSCode(req)
   }
 
   try {
-    vscodeServers.set(studentId, await vscodeServersLoading.get(studentId)!)
+    vscodeServer = await vscodeServerPromise
   } catch (error) {
-    vscodeServersLoading.delete(studentId)
-    logError(logger, "CodeServerRouteWrapper", error)
+    vscodeServerPromise = undefined
+    logError(logger, "CodeServerLoad", error)
     if (isDevMode) {
       return next(
         new Error(
@@ -105,10 +162,11 @@ export const ensureStudentVSCodeLoaded = async (
     }
     return next(error)
   }
+
   return next()
 }
 
-router.get("/", ensureStudentVSCodeLoaded, async (req, res, next) => {
+router.get("/", ensureVSCodeLoaded, async (req, res, next) => {
   const isAuthenticated = await authenticated(req)
   const NO_FOLDER_OR_WORKSPACE_QUERY = !req.query.folder && !req.query.workspace
   const FOLDER_OR_WORKSPACE_WAS_CLOSED = req.query.ew
@@ -120,11 +178,12 @@ router.get("/", ensureStudentVSCodeLoaded, async (req, res, next) => {
     })
   }
 
-  if ((NO_FOLDER_OR_WORKSPACE_QUERY || FOLDER_OR_WORKSPACE_WAS_CLOSED)) {
+  if (NO_FOLDER_OR_WORKSPACE_QUERY || FOLDER_OR_WORKSPACE_WAS_CLOSED) {
     const studentId = getStudentId(req)
     const to = self(req)
 
     if (studentId) {
+      await ensureStudentWorkspace(studentId)
       return redirect(req, res, to, {
         folder: getStudentWorkspaceDir(studentId),
       })
@@ -195,52 +254,36 @@ router.get("/manifest.json", async (req, res) => {
   )
 })
 
-const mintKeyPromises = new Map<string, Promise<Buffer>>()
+// Single mint-key for the whole server instance
+let mintKeyPromise: Promise<Buffer> | undefined
 router.post("/mint-key", async (req, res) => {
-  const studentId = getStudentId(req)
-
-  if (!mintKeyPromises.has(studentId)) {
-    mintKeyPromises.set(
-      studentId,
-      new Promise(async (resolve) => {
-        const keyPath = path.join(getStudentDataDir(studentId), "serve-web-key-half")
-        logger.debug(`Reading server web key half from ${keyPath}`)
-        try {
-          resolve(await fs.readFile(keyPath))
-          return
-        } catch (error: any) {
-          if (error.code !== "ENOENT") {
-            logError(logger, `read ${keyPath}`, error)
-          }
+  if (!mintKeyPromise) {
+    mintKeyPromise = new Promise(async (resolve) => {
+      const keyPath = path.join(req.args["user-data-dir"] || "", "serve-web-key-half")
+      logger.debug(`Reading server web key half from ${keyPath}`)
+      try {
+        resolve(await fs.readFile(keyPath))
+        return
+      } catch (error: any) {
+        if (error.code !== "ENOENT") {
+          logError(logger, `read ${keyPath}`, error)
         }
-        const key = crypto.randomBytes(32)
-        try {
-          await fs.writeFile(keyPath, key)
-        } catch (error: any) {
-          logError(logger, `write ${keyPath}`, error)
-        }
-        resolve(key)
-      }),
-    )
+      }
+      const key = crypto.randomBytes(32)
+      try {
+        await fs.writeFile(keyPath, key)
+      } catch (error: any) {
+        logError(logger, `write ${keyPath}`, error)
+      }
+      resolve(key)
+    })
   }
-  const key = await mintKeyPromises.get(studentId)!
+  const key = await mintKeyPromise
   res.end(key)
 })
 
-router.all(/.*/, ensureAuthenticated, ensureStudentVSCodeLoaded, async (req, res) => {
-  const studentId = getStudentId(req)
-  if (studentId) {
-    vscodeServers.get(studentId)!.handleRequest(req, res)
-  } else {
-    // Fallback for requests without student header: use the first available
-    // server or the one created by the first user.
-    const first = vscodeServers.values().next().value
-    if (first) {
-      first.handleRequest(req, res)
-    } else {
-      res.status(503).send("No VS Code server available")
-    }
-  }
+router.all(/.*/, ensureAuthenticated, ensureVSCodeLoaded, async (req, res) => {
+  vscodeServer!.handleRequest(req, res)
 })
 
 const socketProxyProvider = new SocketProxyProvider()
@@ -248,34 +291,19 @@ wsRouter.ws(
   /.*/,
   ensureOrigin,
   ensureAuthenticated,
-  ensureStudentVSCodeLoaded,
+  ensureVSCodeLoaded,
   async (req: WebsocketRequest) => {
-    const studentId = getStudentId(req)
-    const server = studentId ? vscodeServers.get(studentId) : undefined
-
-    if (server) {
-      const wrappedSocket = await socketProxyProvider.createProxy(req.ws)
-      server.handleUpgrade(req, wrappedSocket as net.Socket)
-      req.ws.resume()
-    } else {
-      // Fallback: use the first available server.
-      const first = vscodeServers.values().next().value
-      if (first) {
-        const wrappedSocket = await socketProxyProvider.createProxy(req.ws)
-        first.handleUpgrade(req, wrappedSocket as net.Socket)
-        req.ws.resume()
-      } else {
-        req.ws.destroy()
-      }
-    }
+    const wrappedSocket = await socketProxyProvider.createProxy(req.ws)
+    vscodeServer!.handleUpgrade(req, wrappedSocket as net.Socket)
+    req.ws.resume()
   },
 )
 
-export function dispose() {
-  for (const server of vscodeServers.values()) {
-    server.dispose()
+export function dispose(): void {
+  if (vscodeServer) {
+    vscodeServer.dispose()
   }
-  vscodeServers.clear()
-  vscodeServersLoading.clear()
+  vscodeServer = undefined
+  vscodeServerPromise = undefined
   socketProxyProvider.stop()
 }
